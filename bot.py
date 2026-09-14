@@ -326,6 +326,21 @@ async def main():
             "Настоятельно рекомендуется указать свой ID в .env!"
         )
 
+    # Запуск веб-сервера для облачных платформ (Render, Koyeb и др.)
+    port = int(os.getenv("PORT", "0"))
+    if port:
+        from aiohttp import web
+        async def ping_handler(request):
+            return web.Response(text="OK - MaximPhotoBot is running!")
+        app = web.Application()
+        app.router.add_get("/", ping_handler)
+        app.router.add_get("/health", ping_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"Веб-сервер проверки статуса запущен на порту {port}")
+
     # Запуск поллинга (drop_pending_updates=False, чтобы получить отправленные ранее сообщения)
     try:
         await bot.delete_webhook(drop_pending_updates=False)
