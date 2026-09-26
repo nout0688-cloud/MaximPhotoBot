@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: MaximPhotoBot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: CACHE_TIME
+        value: "1"
+      - key: PORT
+        fromPort:
+          name: health
+          port: 10000
+    plan: free
+    region: frankfurt
