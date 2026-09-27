@@ -4,18 +4,18 @@ import os
 import sys
 from typing import Optional
 
-# Настройка UTF-8 для Windows-консоли (поддержка эмодзи и кириллицы)
 if sys.platform == "win32":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -29,250 +29,543 @@ from aiogram.types import (
 
 import config
 from database import (
-    add_photo,
-    count_photos,
-    delete_photo,
-    get_photo_by_id,
-    get_photos,
-    init_db,
+    add_friend, add_photo, count_friends, count_photos,
+    delete_photo, get_friend, get_friends, get_photo_by_id,
+    get_photos, init_db, is_friend, remove_friend,
 )
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("MaximPhotoBot")
 
 router = Router()
+PER_PAGE = 5
 
+
+# ══════════════════ FSM ══════════════════
+
+class AddFriendState(StatesGroup):
+    waiting = State()
+
+
+# ══════════════════ AUTH HELPER ══════════════════
+
+async def is_authorized(uid: int) -> bool:
+    return config.is_admin(uid) or await is_friend(uid)
+
+
+# ══════════════════ KEYBOARDS ══════════════════
+
+def kb_main(is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📸 Фото", callback_data="m:ph"),
+         InlineKeyboardButton(text="👥 Друзі", callback_data="m:fr")],
+        [InlineKeyboardButton(text="ℹ️ Як користуватися", callback_data="m:help")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_photos_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Переглянути всі", callback_data="pl:0")],
+        [InlineKeyboardButton(text="⬅️ Головне меню", callback_data="m:main")],
+    ])
+
+
+def kb_photo_list(photos: list, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    for p in photos:
+        cap = p["caption"] or "без назви"
+        if len(cap) > 22:
+            cap = cap[:19] + "…"
+        rows.append([
+            InlineKeyboardButton(text=f"🖼 #{p['id']}: {cap}", callback_data=f"pv:{p['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"pd:{p['id']}"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"pl:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"· {page + 1}/{total_pages} ·", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"pl:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="m:ph")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_photo_view(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Видалити це фото", callback_data=f"pd:{pid}")],
+        [InlineKeyboardButton(text="⬅️ До списку", callback_data="pl:0")],
+    ])
+
+
+def kb_confirm_delete_photo(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Так, видалити", callback_data=f"pdc:{pid}"),
+         InlineKeyboardButton(text="❌ Ні", callback_data="pl:0")],
+    ])
+
+
+def kb_friends(friends: list, is_admin: bool) -> InlineKeyboardMarkup:
+    rows = []
+    for f in friends:
+        name = f["first_name"] or f["username"] or str(f["user_id"])
+        row = [InlineKeyboardButton(text=f"👤 {name}", callback_data="noop")]
+        if is_admin:
+            row.append(InlineKeyboardButton(text="❌", callback_data=f"fd:{f['user_id']}"))
+        rows.append(row)
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="➕ Додати друга", callback_data="fa")])
+    rows.append([InlineKeyboardButton(text="⬅️ Головне меню", callback_data="m:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_confirm_delete_friend(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Так, видалити", callback_data=f"fdc:{uid}"),
+         InlineKeyboardButton(text="❌ Ні", callback_data="m:fr")],
+    ])
+
+
+def kb_back(target: str = "m:main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Головне меню", callback_data=target)],
+    ])
+
+
+def kb_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="m:fr")],
+    ])
+
+
+# ══════════════════ RENDER HELPERS ══════════════════
+
+async def render_main(user, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    total = await count_photos()
+    is_adm = config.is_admin(user.id)
+    role = "👑 Адмін" if is_adm else "👤 Друг"
+    text = (
+        f"{'═' * 26}\n"
+        f"  👋 <b>{user.first_name}</b>  {role}\n"
+        f"{'═' * 26}\n\n"
+        f"  📸  Фото в колекції: <b>{total}</b>\n"
+        f"  🤖  Інлайн: <code>@{bot_username}</code>\n\n"
+        f"  Обери дію нижче ⤵️"
+    )
+    return text, kb_main(is_adm)
+
+
+async def render_photo_list(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    total = await count_photos()
+    if total == 0:
+        text = "📭 <b>Колекція порожня</b>\n\nНадішли мені фото, щоб додати!"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="m:ph")]
+        ])
+        return text, kb
+    total_pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    photos = await get_photos(limit=PER_PAGE, offset=page * PER_PAGE)
+    text = (
+        f"📸 <b>Фото</b>  ·  {total} шт.  ·  стор. {page + 1}/{total_pages}\n"
+        f"{'─' * 30}\n"
+    )
+    for p in photos:
+        cap = p["caption"] or "без назви"
+        text += f"  • <b>#{p['id']}</b> — {cap}\n"
+    text += f"{'─' * 30}\n🖼 — переглянути  ·  🗑 — видалити"
+    return text, kb_photo_list(photos, page, total_pages)
+
+
+async def render_friends(is_admin: bool) -> tuple[str, InlineKeyboardMarkup]:
+    friends = await get_friends()
+    total = len(friends)
+    text = (
+        f"👥 <b>Друзі</b>  ·  {total} чол.\n"
+        f"{'─' * 30}\n"
+    )
+    if total == 0:
+        text += "  Поки що нікого немає\n"
+        if is_admin:
+            text += "\n  💡 Натисни <b>➕ Додати друга</b>"
+    else:
+        for f in friends:
+            name = f["first_name"] or "—"
+            uname = f" · @{f['username']}" if f["username"] else ""
+            text += f"  👤 <b>{name}</b>{uname}\n      ID: <code>{f['user_id']}</code>\n"
+    text += f"{'─' * 30}"
+    return text, kb_friends(friends, is_admin)
+
+
+# ══════════════════ /START ══════════════════
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, bot: Bot):
-    """Приветственное сообщение и базовая инструкция."""
-    bot_info = await bot.get_me()
-    text = (
-        f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
-        f"Этот бот позволяет моментально отправлять твои сохранённые фото в любых чатах через инлайн-режим.\n\n"
-        f"<b>Как это работает:</b>\n"
-        f"1. 📸 Просто <b>скинь мне фото сюда в ЛС</b> (можно с подписью-описанием).\n"
-        f"2. 💬 В любом диалоге или группе начни писать: <code>@{bot_info.username}</code>\n"
-        f"3. 🖼 Появится меню с твоими картинками — нажимай на любую, и она мгновенно отправится другу!\n\n"
-        f"<b>Поиск по фото:</b>\n"
-        f"Если добавить фото с подписью (например, <i>мем с котом</i>), то при вызове "
-        f"<code>@{bot_info.username} кот</code> найдутся именно подходящие фото.\n\n"
-        f"<b>Доступные команды:</b>\n"
-        f"• /list — просмотр и удаление сохранённых фото\n"
-        f"• /count — количество сохранённых фото\n"
-        f"• /myid — узнать свой Telegram ID (для настройки доступа в .env)"
-    )
-    await message.answer(text)
+async def cmd_start(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
 
-
-@router.message(Command("myid"))
-async def cmd_myid(message: Message):
-    """Показывает пользователю его Telegram ID."""
-    user_id = message.from_user.id
-    is_adm = config.is_admin(user_id)
-    status = "👑 Администратор" if is_adm else "👤 Обычный пользователь"
-    await message.answer(
-        f"Ваш Telegram ID: <code>{user_id}</code>\n"
-        f"Статус доступа: {status}\n\n"
-        f"<i>Укажите этот ID в файле <code>.env</code> в строке <code>ADMIN_ID={user_id}</code>, "
-        f"чтобы только вы могли управлять коллекцией фото.</i>"
-    )
-
-
-@router.message(Command("count"))
-async def cmd_count(message: Message):
-    """Показывает общее количество фото в базе."""
-    total = await count_photos()
-    await message.answer(f"📊 В базе сейчас сохранено фото: <b>{total}</b>")
-
-
-@router.message(F.photo)
-async def handle_incoming_photo(message: Message, bot: Bot):
-    """Обработка входящих фотографий для сохранения в базу."""
-    user_id = message.from_user.id
-    logger.info(f"Получено фото от пользователя ID: {user_id}")
-
-    if not config.is_admin(user_id):
-        logger.warning(f"Пользователь {user_id} не админ. Доступ запрещен.")
+    if not await is_authorized(uid):
         await message.answer(
-            "⛔️ У вас нет прав для добавления фотографий в эту подборку.\n"
-            "Добавлять фото может только владелец бота (администратор)."
+            f"👋 Привіт, <b>{message.from_user.first_name}</b>!\n\n"
+            f"⛔️ У тебе поки немає доступу.\n"
+            f"Попроси адміністратора додати тебе.\n\n"
+            f"🆔 Твій ID: <code>{uid}</code>\n"
+            f"<i>Скинь цей ID адміну</i>"
         )
         return
 
-    # Берем вариант фото с максимальным разрешением
-    photo = message.photo[-1]
-    file_id = photo.file_id
-    caption = message.caption or ""
+    bot_me = await bot.get_me()
+    text, kb = await render_main(message.from_user, bot_me.username)
+    await message.answer(text, reply_markup=kb)
 
-    photo_id = await add_photo(file_id=file_id, caption=caption)
-    logger.info(f"Фото успешно сохранено в базу! ID: {photo_id}, caption: '{caption}'")
-    bot_info = await bot.get_me()
 
-    desc_text = f"\nПодпись: <i>{caption}</i>" if caption else " (без подписи)"
-    await message.answer(
-        f"✅ <b>Фото успешно сохранено!</b> [ID: #{photo_id}]{desc_text}\n\n"
-        f"Теперь ты можешь отправить его в любом чате:\n"
-        f"Напиши <code>@{bot_info.username}</code> и выбери картинку!"
+# ══════════════════ NAVIGATION ══════════════════
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(q: CallbackQuery):
+    await q.answer()
+
+
+@router.callback_query(F.data == "m:main")
+async def cb_main(q: CallbackQuery, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not await is_authorized(q.from_user.id):
+        await q.answer("⛔️ Немає доступу", show_alert=True)
+        return
+    bot_me = await bot.get_me()
+    text, kb = await render_main(q.from_user, bot_me.username)
+    try:
+        await q.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await q.message.answer(text, reply_markup=kb)
+    await q.answer()
+
+
+@router.callback_query(F.data == "m:help")
+async def cb_help(q: CallbackQuery, bot: Bot):
+    bot_me = await bot.get_me()
+    text = (
+        f"<b>ℹ️ Як користуватися</b>\n"
+        f"{'─' * 30}\n\n"
+        f"<b>📸 Додати фото:</b>\n"
+        f"Просто надішли картинку сюди в чат.\n"
+        f"Можна додати підпис для пошуку!\n\n"
+        f"<b>💬 Надіслати фото другу:</b>\n"
+        f"В будь-якому чаті набери:\n"
+        f"<code>@{bot_me.username} </code>\n"
+        f"Обери фото з меню — воно полетить!\n\n"
+        f"<b>🔍 Пошук:</b>\n"
+        f"<code>@{bot_me.username} кот</code>\n"
+        f"Знайде фото з підписом «кот»\n\n"
+        f"<b>👥 Друзі:</b>\n"
+        f"Адмін додає друзів, які теж\n"
+        f"можуть додавати та видаляти фото."
     )
+    await q.message.edit_text(text, reply_markup=kb_back())
+    await q.answer()
+
+
+# ══════════════════ PHOTO MENU ══════════════════
+
+@router.callback_query(F.data == "m:ph")
+async def cb_photos_menu(q: CallbackQuery):
+    if not await is_authorized(q.from_user.id):
+        await q.answer("⛔️ Немає доступу", show_alert=True)
+        return
+    total = await count_photos()
+    text = (
+        f"<b>📸 Фото</b>  ·  {total} шт.\n"
+        f"{'─' * 30}\n\n"
+        f"💡 Щоб <b>додати</b> нове фото —\n"
+        f"просто надішли картинку сюди в чат\n"
+        f"(можна з підписом для пошуку)"
+    )
+    await q.message.edit_text(text, reply_markup=kb_photos_menu())
+    await q.answer()
+
+
+@router.callback_query(F.data.startswith("pl:"))
+async def cb_photo_list(q: CallbackQuery):
+    if not await is_authorized(q.from_user.id):
+        await q.answer("⛔️ Немає доступу", show_alert=True)
+        return
+    page = int(q.data.split(":")[1])
+    text, kb = await render_photo_list(page)
+    try:
+        await q.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
+    await q.answer()
+
+
+@router.callback_query(F.data.startswith("pv:"))
+async def cb_photo_view(q: CallbackQuery):
+    if not await is_authorized(q.from_user.id):
+        await q.answer("⛔️ Немає доступу", show_alert=True)
+        return
+    pid = int(q.data.split(":")[1])
+    photo = await get_photo_by_id(pid)
+    if not photo:
+        await q.answer("❌ Фото не знайдено", show_alert=True)
+        return
+    cap = f"📸 <b>Фото #{photo['id']}</b>"
+    if photo["caption"]:
+        cap += f"\n📝 {photo['caption']}"
+    await q.message.answer_photo(
+        photo=photo["file_id"], caption=cap,
+        reply_markup=kb_photo_view(photo["id"])
+    )
+    await q.answer()
+
+
+@router.callback_query(F.data.startswith("pd:"))
+async def cb_photo_delete_ask(q: CallbackQuery):
+    if not await is_authorized(q.from_user.id):
+        await q.answer("⛔️ Немає доступу", show_alert=True)
+        return
+    pid = int(q.data.split(":")[1])
+    photo = await get_photo_by_id(pid)
+    if not photo:
+        await q.answer("❌ Фото вже видалено", show_alert=True)
+        return
+    cap = photo["caption"] or "без назви"
+    text = (
+        f"🗑 <b>Видалити фото #{pid}?</b>\n\n"
+        f"📝 Підпис: <i>{cap}</i>"
+    )
+    try:
+        await q.message.edit_text(text, reply_markup=kb_confirm_delete_photo(pid))
+    except Exception:
+        await q.message.answer(text, reply_markup=kb_confirm_delete_photo(pid))
+    await q.answer()
+
+
+@router.callback_query(F.data.startswith("pdc:"))
+async def cb_photo_delete_confirm(q: CallbackQuery):
+    if not await is_authorized(q.from_user.id):
+        await q.answer("⛔️ Немає доступу", show_alert=True)
+        return
+    pid = int(q.data.split(":")[1])
+    deleted = await delete_photo(pid)
+    if deleted:
+        await q.answer(f"✅ Фото #{pid} видалено!", show_alert=True)
+        logger.info(f"Фото #{pid} видалено користувачем {q.from_user.id}")
+    else:
+        await q.answer("❌ Фото вже було видалено", show_alert=True)
+    text, kb = await render_photo_list(0)
+    try:
+        await q.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
+
+
+# ══════════════════ PHOTO RECEPTION ══════════════════
+
+@router.message(F.photo)
+async def handle_photo(message: Message, bot: Bot, state: FSMContext):
+    uid = message.from_user.id
+    if not await is_authorized(uid):
+        await message.answer(
+            f"⛔️ Немає доступу.\n"
+            f"🆔 Твій ID: <code>{uid}</code>\n"
+            f"Попроси адміністратора додати тебе."
+        )
+        return
+    await state.clear()
+    photo = message.photo[-1]
+    caption = message.caption or ""
+    pid = await add_photo(file_id=photo.file_id, caption=caption, added_by=uid)
+    bot_me = await bot.get_me()
+    desc = f"\n📝 <i>{caption}</i>" if caption else ""
+    await message.answer(
+        f"✅ <b>Фото збережено!</b>  #{pid}{desc}\n\n"
+        f"Надішли в будь-якому чаті:\n"
+        f"<code>@{bot_me.username}</code>",
+        reply_markup=kb_main(config.is_admin(uid))
+    )
+    logger.info(f"Фото #{pid} додано від {uid}, caption: '{caption}'")
 
 
 @router.message(F.document)
 async def handle_document(message: Message):
-    """Предупреждение, если фото отправлено как файл без сжатия."""
+    if not await is_authorized(message.from_user.id):
+        return
     await message.answer(
-        "⚠️ Вы отправили файл как документ.\n\n"
-        "Чтобы фотографию можно было отправлять в инлайн-режиме, отправьте её "
-        "<b>как фотографию (сжатое изображение)</b>, а не как файл!"
+        "⚠️ Надішли фото <b>як зображення</b> (зі стисненням),\n"
+        "а не як файл!",
+        reply_markup=kb_back()
     )
 
 
+# ══════════════════ FRIENDS MENU ══════════════════
 
-@router.message(Command("list"))
-async def cmd_list(message: Message):
-    """Выводит список последних фото с кнопками для удаления."""
-    user_id = message.from_user.id
-    if not config.is_admin(user_id):
-        await message.answer("⛔️ Эта команда доступна только администратору.")
+@router.callback_query(F.data == "m:fr")
+async def cb_friends_menu(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    uid = q.from_user.id
+    if not await is_authorized(uid):
+        await q.answer("⛔️ Немає доступу", show_alert=True)
         return
+    text, kb = await render_friends(config.is_admin(uid))
+    try:
+        await q.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await q.message.answer(text, reply_markup=kb)
+    await q.answer()
 
-    photos = await get_photos(limit=20)
-    if not photos:
+
+@router.callback_query(F.data == "fa")
+async def cb_friend_add(q: CallbackQuery, state: FSMContext):
+    if not config.is_admin(q.from_user.id):
+        await q.answer("⛔️ Тільки адмін", show_alert=True)
+        return
+    await state.set_state(AddFriendState.waiting)
+    await q.message.edit_text(
+        f"<b>➕ Додати друга</b>\n"
+        f"{'─' * 30}\n\n"
+        f"Надішли мені одне з:\n\n"
+        f"  1️⃣ <b>Перешли</b> повідомлення від друга\n"
+        f"  2️⃣ Напиши його <b>числовий ID</b>\n\n"
+        f"<i>Друг може дізнатися свій ID,\n"
+        f"написавши /start цьому боту</i>",
+        reply_markup=kb_cancel()
+    )
+    await q.answer()
+
+
+@router.message(AddFriendState.waiting, F.text)
+async def handle_friend_text(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = message.text.strip()
+    if not text.isdigit():
         await message.answer(
-            "📭 У вас пока нет сохранённых фото.\n"
-            "Отправьте мне картинку в ЛС, чтобы добавить!"
+            "❌ Це не схоже на ID.\n\n"
+            "Надішли <b>числовий ID</b> друга\n"
+            "або <b>перешли</b> його повідомлення.",
+            reply_markup=kb_cancel()
         )
         return
-
-    text = "<b>📸 Список последних сохранённых фото:</b>\n\n"
-    keyboard_buttons = []
-
-    for p in photos:
-        pid = p["id"]
-        cap = p["caption"] if p["caption"] else "без названия"
-        # Обрезаем длинные подписи для читаемости
-        if len(cap) > 25:
-            cap = cap[:22] + "..."
-        text += f"• <b>#{pid}</b>: {cap}\n"
-        keyboard_buttons.append([
-            InlineKeyboardButton(text=f"👁 Показать #{pid}", callback_data=f"view:{pid}"),
-            InlineKeyboardButton(text=f"🗑 Удалить #{pid}", callback_data=f"del:{pid}")
-        ])
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer(text, reply_markup=keyboard)
+    friend_id = int(text)
+    await _do_add_friend(message, state, friend_id, "", "")
 
 
-@router.callback_query(F.data.startswith("view:"))
-async def cb_view_photo(query: CallbackQuery):
-    """Показывает превью фото по ID."""
-    try:
-        photo_id = int(query.data.split(":")[1])
-        photo = await get_photo_by_id(photo_id)
-        if not photo:
-            await query.answer("❌ Фото не найдено или уже удалено.", show_alert=True)
-            return
-
-        caption = f"Фото #{photo['id']}"
-        if photo["caption"]:
-            caption += f"\nПодпись: {photo['caption']}"
-
-        del_kb = InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(text="🗑 Удалить это фото", callback_data=f"del:{photo['id']}")
-            ]]
-        )
-        await query.message.answer_photo(
-            photo=photo["file_id"],
-            caption=caption,
-            reply_markup=del_kb
-        )
-        await query.answer()
-    except Exception as e:
-        logger.error(f"Ошибка при показе фото: {e}")
-        await query.answer("Ошибка при отображении фото.")
-
-
-@router.callback_query(F.data.startswith("del:"))
-async def cb_delete_photo(query: CallbackQuery):
-    """Удаляет фото по ID из базы."""
-    user_id = query.from_user.id
-    if not config.is_admin(user_id):
-        await query.answer("⛔️ Только администратор может удалять фото.", show_alert=True)
+@router.message(AddFriendState.waiting, F.forward_from)
+async def handle_friend_forward(message: Message, state: FSMContext):
+    if not config.is_admin(message.from_user.id):
+        await state.clear()
         return
+    fwd = message.forward_from
+    await _do_add_friend(message, state, fwd.id, fwd.username or "", fwd.first_name or "")
 
+
+@router.message(AddFriendState.waiting)
+async def handle_friend_other(message: Message, state: FSMContext):
+    """Якщо друг приховав пересилання або надіслано щось інше."""
+    if not config.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    await message.answer(
+        "❌ Не вдалося отримати ID.\n\n"
+        "Можливо, у друга ввімкнена приватність\n"
+        "пересиланих повідомлень.\n\n"
+        "Попроси його написати /start цьому боту\n"
+        "і надіслати тобі свій <b>числовий ID</b>.",
+        reply_markup=kb_cancel()
+    )
+
+
+async def _do_add_friend(message: Message, state: FSMContext,
+                          friend_id: int, username: str, first_name: str):
+    admin_id = message.from_user.id
+    if config.is_admin(friend_id):
+        await message.answer("ℹ️ Це адміністратор — додавати не потрібно!",
+                             reply_markup=kb_back("m:fr"))
+        await state.clear()
+        return
+    added = await add_friend(friend_id, username, first_name, admin_id)
+    await state.clear()
+    name = first_name or username or str(friend_id)
+    if added:
+        logger.info(f"Друг {friend_id} ({name}) доданий адміном {admin_id}")
+        await message.answer(
+            f"✅ <b>{name}</b> доданий як друг!\n"
+            f"ID: <code>{friend_id}</code>\n\n"
+            f"Тепер він може додавати\n"
+            f"та видаляти фото 📸",
+            reply_markup=kb_back("m:fr")
+        )
+    else:
+        await message.answer(
+            f"ℹ️ <b>{name}</b> вже є другом!",
+            reply_markup=kb_back("m:fr")
+        )
+
+
+@router.callback_query(F.data.startswith("fd:"))
+async def cb_friend_delete_ask(q: CallbackQuery):
+    if not config.is_admin(q.from_user.id):
+        await q.answer("⛔️ Тільки адмін", show_alert=True)
+        return
+    fuid = int(q.data.split(":")[1])
+    friend = await get_friend(fuid)
+    if not friend:
+        await q.answer("❌ Друга не знайдено", show_alert=True)
+        return
+    name = friend["first_name"] or friend["username"] or str(fuid)
+    await q.message.edit_text(
+        f"❌ <b>Видалити друга?</b>\n\n"
+        f"👤 <b>{name}</b>\n"
+        f"ID: <code>{fuid}</code>",
+        reply_markup=kb_confirm_delete_friend(fuid)
+    )
+    await q.answer()
+
+
+@router.callback_query(F.data.startswith("fdc:"))
+async def cb_friend_delete_confirm(q: CallbackQuery, state: FSMContext):
+    if not config.is_admin(q.from_user.id):
+        await q.answer("⛔️ Тільки адмін", show_alert=True)
+        return
+    fuid = int(q.data.split(":")[1])
+    removed = await remove_friend(fuid)
+    if removed:
+        await q.answer("✅ Друга видалено!", show_alert=True)
+        logger.info(f"Друг {fuid} видалений адміном {q.from_user.id}")
+    else:
+        await q.answer("❌ Друга вже видалено", show_alert=True)
+    text, kb = await render_friends(True)
     try:
-        photo_id = int(query.data.split(":")[1])
-        deleted = await delete_photo(photo_id)
-        if deleted:
-            await query.answer(f"✅ Фото #{photo_id} удалено!", show_alert=True)
-            # Если сообщение было текстом со списком, обновляем список
-            if query.message.text and "Список последних" in query.message.text:
-                photos = await get_photos(limit=20)
-                if not photos:
-                    await query.message.edit_text("📭 Все сохранённые фото удалены.")
-                    return
-                text = "<b>📸 Список последних сохранённых фото:</b>\n\n"
-                keyboard_buttons = []
-                for p in photos:
-                    pid = p["id"]
-                    cap = p["caption"] if p["caption"] else "без названия"
-                    if len(cap) > 25:
-                        cap = cap[:22] + "..."
-                    text += f"• <b>#{pid}</b>: {cap}\n"
-                    keyboard_buttons.append([
-                        InlineKeyboardButton(text=f"👁 Показать #{pid}", callback_data=f"view:{pid}"),
-                        InlineKeyboardButton(text=f"🗑 Удалить #{pid}", callback_data=f"del:{pid}")
-                    ])
-                keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-                await query.message.edit_text(text, reply_markup=keyboard)
-            elif query.message.photo:
-                # Если удалили через превью фото
-                await query.message.delete()
-        else:
-            await query.answer("Фото уже было удалено.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Ошибка при удалении фото: {e}")
-        await query.answer("Произошла ошибка при удалении.")
+        await q.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
 
+
+# ══════════════════ INLINE QUERY ══════════════════
 
 @router.inline_query()
-async def handle_inline_query(inline_query: InlineQuery):
-    """
-    Обработка инлайн-запросов (@username_бота [текст_поиска]).
-    Возвращает список сохранённых фото через InlineQueryResultCachedPhoto.
-    """
-    query_text = inline_query.query.strip()
+async def handle_inline(iq: InlineQuery):
+    query_text = iq.query.strip()
     photos = await get_photos(query=query_text, limit=50)
 
     if not photos:
-        # Если фото нет в базе или поиск ничего не нашел
-        msg_text = (
-            "🔍 Фото не найдены."
-            if query_text
-            else "📭 В боте пока нет фото. Отправь фото боту в ЛС, чтобы добавить!"
-        )
+        msg = "🔍 Нічого не знайдено" if query_text else "📭 Колекція порожня"
         results = [
             InlineQueryResultArticle(
-                id="empty_info",
-                title="Нет фото для отправки",
-                description=msg_text,
+                id="empty", title="Немає фото",
+                description=msg,
                 input_message_content=InputTextMessageContent(
-                    message_text=f"💡 <i>{msg_text}</i>",
-                    parse_mode=ParseMode.HTML
+                    message_text=f"💡 <i>{msg}</i>", parse_mode=ParseMode.HTML
                 )
             )
         ]
-        await inline_query.answer(
-            results=results,
-            cache_time=config.CACHE_TIME,
-            is_personal=True
-        )
+        await iq.answer(results=results, cache_time=config.CACHE_TIME, is_personal=True)
         return
 
     results = []
@@ -283,66 +576,46 @@ async def handle_inline_query(inline_query: InlineQuery):
                 id=str(p["id"]),
                 photo_file_id=p["file_id"],
                 title=cap or f"Фото #{p['id']}",
-                description=cap if cap else None,
+                description=cap,
                 caption=cap,
-                parse_mode=ParseMode.HTML if cap else None
+                parse_mode=ParseMode.HTML if cap else None,
             )
         )
+    await iq.answer(results=results, cache_time=config.CACHE_TIME, is_personal=True)
 
-    await inline_query.answer(
-        results=results,
-        cache_time=config.CACHE_TIME,
-        is_personal=True
-    )
 
+# ══════════════════ MAIN ══════════════════
 
 async def main():
-    """Точка входа запуска бота."""
     if not config.BOT_TOKEN:
-        logger.error(
-            "❌ ОШИБКА: BOT_TOKEN не задан! "
-            "Создайте файл .env на основе .env.example и укажите токен бота от @BotFather."
-        )
+        logger.error("❌ BOT_TOKEN не задано! Заповни .env файл.")
         return
 
-    # Инициализация базы данных
     await init_db()
-    logger.info("База данных SQLite инициализирована.")
+    logger.info("БД ініціалізовано.")
 
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
+    bot = Bot(token=config.BOT_TOKEN,
+              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
 
     bot_me = await bot.get_me()
-    logger.info(f"Бот @{bot_me.username} успешно запущен!")
-    logger.info(f"Режим кэша инлайна: {config.CACHE_TIME} сек.")
+    logger.info(f"Бот @{bot_me.username} запущено!")
     if config.ADMIN_IDS:
-        logger.info(f"Администраторы бота: {list(config.ADMIN_IDS)}")
-    else:
-        logger.warning(
-            "⚠️ ADMIN_ID не настроен! Любой пользователь сможет добавлять фото. "
-            "Настоятельно рекомендуется указать свой ID в .env!"
-        )
+        logger.info(f"Адміни: {list(config.ADMIN_IDS)}")
 
-    # Запуск веб-сервера для облачных платформ (Render, Koyeb и др.)
+    # Health-check веб-сервер для хостингу (Render / Koyeb)
     port = int(os.getenv("PORT", "0"))
     if port:
         from aiohttp import web
-        async def ping_handler(request):
-            return web.Response(text="OK - MaximPhotoBot is running!")
         app = web.Application()
-        app.router.add_get("/", ping_handler)
-        app.router.add_get("/health", ping_handler)
+        app.router.add_get("/", lambda r: web.Response(text="OK - MaximPhotoBot is running!"))
+        app.router.add_get("/health", lambda r: web.Response(text="OK"))
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        logger.info(f"Веб-сервер проверки статуса запущен на порту {port}")
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        logger.info(f"Health-check сервер на порту {port}")
 
-    # Запуск поллинга (drop_pending_updates=False, чтобы получить отправленные ранее сообщения)
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot)
@@ -354,4 +627,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен.")
+        logger.info("Бот зупинено.")
